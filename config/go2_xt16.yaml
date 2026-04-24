@@ -1,0 +1,100 @@
+/**:
+  ros__parameters:
+
+    common:
+      img_topic: "/camera/color/image_raw"
+      lid_topic: "/lidar_points"
+      imu_topic: "/imu/filtered"
+      img_en: 0
+      lidar_en: 1
+      ros_driver_bug_fix: false
+
+    extrin_calib:
+      extrinsic_T: [0.162886, 0.072124, 0.090100]
+      extrinsic_R: [0.999929, 0.006551, -0.009959, -0.006512, 0.999971, 0.003964, 0.009985, -0.003899, 0.999943]
+      Rcl: [0.0, -1.0, 0.0, 0.0, 0.0, -1.0, 1.0, 0.0, 0.0]
+      Pcl: [0.0, -0.0614, -0.19]
+
+    time_offset:
+      imu_time_offset: 0.1
+      img_time_offset: 0.0
+      lidar_time_offset: 0.0
+      exposure_time_init: 0.0
+
+    preprocess:
+      lidar_type: 5
+      scan_line: 16
+      blind: 0.5
+      point_filter_num: 1
+      filter_size_surf: 0.1
+      feature_extract_enabled: false
+      hilti_en: false
+
+    vio:
+      max_iterations: 5
+      outlier_threshold: 500
+      img_point_cov: 1000
+      patch_size: 8
+      patch_pyrimid_level: 4
+      grid_size: 16
+      grid_n_height: 8
+      normal_en: true
+      raycast_en: false
+      inverse_composition_en: false
+      exposure_estimate_en: false
+      inv_expo_cov: 0.1
+
+    imu:
+      imu_en: true
+      imu_int_frame: 30
+      acc_cov: 0.5
+      gyr_cov: 0.01
+      b_acc_cov: 0.0001
+      b_gyr_cov: 0.0001
+      gravity_est_en: true
+
+    lio:
+      min_iterations: 3
+      voxel_size: 0.1
+      max_layer: 2
+      min_eigen_value: 0.005
+      sigma_num: 3.0
+      beam_err: 0.01
+      dept_err: 0.001
+      max_points_num: 150
+      layer_init_num: [5, 5, 5, 5, 5]
+
+    local_map:
+      map_sliding_en: false
+      half_map_size: 100
+      sliding_thresh: 8.0
+
+    uav:
+      imu_rate_odom: false
+      gravity_align_en: false
+
+    publish:
+      dense_map_en: false
+      pub_effect_point_en: false
+      pub_plane_en: false
+      pub_scan_num: 1
+      blind_rgb_points: 0.0
+
+    evo:
+      seq_name: "go2_run"
+      pose_output_en: false
+
+    pcd_save:
+      pcd_save_en: false
+      type: 0
+      colmap_output_en: false
+      filter_size_pcd: 0.15
+      interval: -1
+
+    image_save:
+      img_save_en: false
+      interval: 1
+
+    debug:
+      plot_time: -10.0
+      frame_cnt: 6
