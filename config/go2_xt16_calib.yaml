@@ -1,3 +1,6 @@
+# go2_xt16_calib.yaml -- go2_xt16.yaml with the FAST-Calib camera<-lidar extrinsic.
+# Created 2026-09-28. Only extrin_calib.Rcl/Pcl and publish.dense_map_en differ.
+# go2_xt16.yaml is left untouched so the two can be A/B compared on one bag.
 /**:
   ros__parameters:
 
@@ -53,22 +56,33 @@
       extrinsic_R: [1.0, 0.0, 0.0,
                     0.0, 1.0, 0.0,
                     0.0, 0.0, 1.0]
-      # Camera<-lidar extrinsic from the manual CloudCompare alignment in
-      # ~/max_brain_calib/2026-08-20_16-53-35, visually validated on sessions 1-4.
-      # Recovered numerically (Kabsch) from session*_camera_in_lidar_frame_manual.pcd
-      # against the raw camera_xyz.npy, max residual 6.4e-07 m, all four sessions
-      # agreeing to 1e-09. The tool emits lidar<-camera, so this is its inverse.
-      #   source (lidar frame): xyz [0.2001, 0.0276, -0.0068]
-      #                         rpy [-94.2229, 0.0011, -89.9830] deg
-      #   previous nominal:     Rcl [0,-1,0, 0,0,-1, 1,0,0]  Pcl [0.0, -0.0614, -0.19]
-      #   delta applied:        4.223 deg rotation, 7.53 cm translation
-      # UNRESOLVED: this puts the camera ~0.7 cm below the lidar, while
-      # go2_description's URDF says 6.14 cm -- a 5.5 cm discrepancy. Confirm by hand;
-      # if the URDF is the correct one, this extrinsic absorbed a vertical error.
-      Rcl: [0.000296, -1.000000, -0.000020,
-           -0.073637, -0.000002, -0.997285,
-            0.997285,  0.000297, -0.073637]
-      Pcl: [0.027541, 0.007953, -0.200066]
+      # Camera<-lidar extrinsic from FAST-Calib (src/FAST-Calib-ROS2), 2026-09-28.
+      # SUPERSEDES the manual CloudCompare alignment that go2_xt16.yaml still holds
+      # (that one is 4.2 deg off in rotation and +65 mm off in Pcl[1]).
+      #
+      #   rotation: FAST-Calib scene1, re-run with marker_corner_shift [0,0,3,0] --
+      #             the board's id3 ArUco is glued on 90 deg clockwise, which biased
+      #             every pre-fix result by 4.67 deg / 9.5 mm. This rotation is
+      #             0.78 deg from the nominal axis-aligned [0,-1,0, 0,0,-1, 1,0,0],
+      #             and scenes 7 and 8 independently agree with it to 0.5-1.0 deg.
+      #   Pcl[0] = +28.5 mm   calibration +27.5, caliper +29.8 -> agree to 2.3 mm
+      #   Pcl[1] = -57.1 mm   calibration, mean of scenes 1/7/8
+      #   Pcl[2] = -212.0 mm  calibration, stable at -210 +-3 mm over all six scenes
+      #
+      # Pcl[1] is the one axis where the methods disagreed. A caliper chain through
+      # go2_description's URDF gave -40.5 mm, and the calibration's own per-scene
+      # spread was 39 mm -- almost exactly one XT16 ring pitch at these ranges
+      # (2.007 deg = 36 mm at 1.04 m), i.e. the vertical hole centre is only weakly
+      # constrained by 16 beams. Settled empirically: the raw cloud was projected
+      # onto the camera image for Y = -25.0 / -40.5 / -48.9 / -57.1 mm on bag
+      # calib_overlay/overlay_check_0928_162334 and compared by eye. -57.1 won.
+      # The -25.0 panel was a deliberate bracket and was clearly distinguishable,
+      # confirming the 15 mm steps were resolvable and the verdict is meaningful.
+      # Renderer: scratchpad overlay.py; see calib_overlay/ysweep.mp4.
+      Rcl: [-0.003991, -0.999992, -0.000250,
+            -0.009464,  0.000288, -0.999955,
+             0.999947, -0.003988, -0.009465]
+      Pcl: [ 0.028500, -0.057100, -0.212000]
 
     time_offset:
       # imu_time_offset KEEPS AT 0.0 -- measured, 2026-08-25. An earlier note claimed
@@ -189,7 +203,11 @@
       gravity_align_en: false
 
     publish:
-      dense_map_en: false
+      # true (go2_xt16.yaml has false): publish/save feats_undistort rather than
+      # feats_down_body (LIVMapper.cpp:524), so the coloured PCD is dense enough
+      # to judge RGB alignment on edges. Costs publish CPU -- drop the bag replay
+      # rate if "IMU and LiDAR not synced" warnings start growing.
+      dense_map_en: true
       pub_effect_point_en: false
       pub_plane_en: false
       pub_scan_num: 1

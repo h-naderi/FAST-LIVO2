@@ -15,12 +15,17 @@ Usage:
 """
 
 import os
+import glob
 import datetime
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, TimerAction, ExecuteProcess, OpaqueFunction
+from launch.actions import (
+    DeclareLaunchArgument, TimerAction, ExecuteProcess, OpaqueFunction,
+    RegisterEventHandler
+)
 from launch.conditions import IfCondition
+from launch.event_handlers import OnProcessStart
 from launch.substitutions import LaunchConfiguration
-from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import get_package_share_directory, get_package_prefix
 from launch_ros.actions import Node
 
 _REPO_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -34,16 +39,43 @@ def _launch_mapping(context, *args, **kwargs):
 
     params_file = context.launch_configurations['main_params_file']
 
+    # Neither `bash -c '... | tee'` nor `ros2 run` forwards SIGINT to the mapper, so
+    # savePCD() (which runs after the rclcpp::ok() loop) never executed and Log/pcd/
+    # went stale. Run the binary directly as launch's child. See "PCD Never Saved"
+    # in CLAUDE.md.
+    mapper_bin = os.path.join(
+        get_package_prefix('fast_livo'), 'lib', 'fast_livo', 'fastlivo_mapping')
+
     mapping = ExecuteProcess(
         cmd=[
-            'bash', '-c',
-            f'ros2 run fast_livo fastlivo_mapping '
-            f'--ros-args --remap __node:=laserMapping --params-file {params_file} '
-            f'2>&1 | tee {log_file}'
+            mapper_bin,
+            '--ros-args', '--remap', '__node:=laserMapping',
+            '--params-file', params_file,
         ],
-        output='screen'
+        name='fastlivo_mapping',
+        output='full',
+        sigterm_timeout='90',
+        sigkill_timeout='60',
     )
-    return [mapping]
+
+    def _link_log(event, context):
+        try:
+            from launch.logging import launch_config
+            matches = glob.glob(os.path.join(
+                launch_config.log_dir, 'fastlivo_mapping-*-stdout.log'))
+            if not matches:
+                return
+            if os.path.islink(log_file) or os.path.exists(log_file):
+                os.remove(log_file)
+            os.symlink(max(matches, key=os.path.getmtime), log_file)
+        except Exception as exc:
+            print(f'[launch] could not link {log_file}: {exc}')
+
+    return [
+        mapping,
+        RegisterEventHandler(OnProcessStart(target_action=mapping,
+                                            on_start=_link_log)),
+    ]
 
 
 def generate_launch_description():

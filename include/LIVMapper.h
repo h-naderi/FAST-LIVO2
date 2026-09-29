@@ -42,6 +42,7 @@ public:
   void handleVIO();
   void handleLIO();
   void savePCD();
+  void checkpointPCD();
   void processImu();
   
   bool sync_packages(LidarMeasureGroup &meas);
@@ -87,6 +88,10 @@ public:
   double last_timestamp_lidar = -1.0, last_timestamp_imu = -1.0, last_timestamp_img = -1.0;
   double filter_size_surf_min = 0;
   double filter_size_pcd = 0;
+  // Periodic crash-safe dump of the accumulated cloud. <= 0 disables.
+  double pcd_checkpoint_sec = 0.0;
+  double last_pcd_checkpoint_ = -1.0;
+  bool pcd_saved_ = false;
   double _first_lidar_time = 0.0;
   double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 

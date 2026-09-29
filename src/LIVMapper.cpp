@@ -12,6 +12,7 @@ which is included as part of this source code package.
 
 #include "LIVMapper.h"
 #include <vikit/camera_loader.h>
+#include <cstdio>   // std::rename, std::remove
 
 using namespace Sophus;
 using namespace std::chrono_literals;
@@ -105,6 +106,7 @@ void LIVMapper::readParameters(rclcpp::Node::SharedPtr &node)
   this->node->declare_parameter<int>("pcd_save.type", 0);
   this->node->declare_parameter<bool>("pcd_save.colmap_output_en", false);
   this->node->declare_parameter<double>("pcd_save.filter_size_pcd", 0.5);
+  this->node->declare_parameter<double>("pcd_save.checkpoint_sec", 30.0);
   this->node->declare_parameter<vector<double>>("extrin_calib.extrinsic_T", vector<double>{});
   this->node->declare_parameter<vector<double>>("extrin_calib.extrinsic_R", vector<double>{});
   this->node->declare_parameter<vector<double>>("extrin_calib.Pcl", vector<double>{});
@@ -154,6 +156,7 @@ void LIVMapper::readParameters(rclcpp::Node::SharedPtr &node)
   this->node->get_parameter("imu.ba_bg_est_en", ba_bg_est_en);
 
   this->node->get_parameter("preprocess.blind", p_pre->blind);
+  p_pre->blind_sqr = p_pre->blind * p_pre->blind;
   this->node->get_parameter("preprocess.filter_size_surf", filter_size_surf_min);
   this->node->get_parameter("preprocess.lidar_type", p_pre->lidar_type);
   this->node->get_parameter("preprocess.scan_line", p_pre->N_SCANS);
@@ -164,6 +167,7 @@ void LIVMapper::readParameters(rclcpp::Node::SharedPtr &node)
   this->node->get_parameter("pcd_save.pcd_save_en", pcd_save_en);
   this->node->get_parameter("pcd_save.colmap_output_en", colmap_output_en);
   this->node->get_parameter("pcd_save.filter_size_pcd", filter_size_pcd);
+  this->node->get_parameter("pcd_save.checkpoint_sec", pcd_checkpoint_sec);
   this->node->get_parameter("extrin_calib.extrinsic_T", extrinT);
   this->node->get_parameter("extrin_calib.extrinsic_R", extrinR);
   this->node->get_parameter("extrin_calib.Pcl", cameraextrinT);
@@ -259,12 +263,27 @@ void LIVMapper::initializeFiles()
 void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node, image_transport::ImageTransport &it_)
 {
   image_transport::ImageTransport it(this->node);
+  // BEST_EFFORT is required, not optional: the Hesai driver publishes with
+  // rclcpp::SensorDataQoS() (BEST_EFFORT, see hesai_lidar_driver's
+  // source_driver_ros2.hpp), and a RELIABLE subscriber cannot receive from a
+  // BEST_EFFORT publisher -- the node runs but processes zero scans, with only
+  // "New publisher discovered on this topic, offering incompatible QoS" as a hint.
+  // BEST_EFFORT is also strictly more permissive: DDS matches when offered >=
+  // requested, so this still receives from RELIABLE publishers such as
+  // `ros2 bag play`, keeping bag playback working.
+  const auto lidar_qos = rclcpp::QoS(rclcpp::KeepLast(200)).best_effort().durability_volatile();
   if (p_pre->lidar_type == AVIA) {
-    sub_pcl = this->node->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 200000, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
+    sub_pcl = this->node->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, lidar_qos, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
   } else {
-    sub_pcl = this->node->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, 200000, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
+    sub_pcl = this->node->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, lidar_qos, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
   }
-  sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 200000, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
+  // Same BEST_EFFORT reasoning as lidar_qos above. /imu/filtered (madgwick) is
+  // RELIABLE, but /imu/data (lowstate_to_imu.py, qos_profile_sensor_data) is
+  // BEST_EFFORT -- a RELIABLE subscriber silently receives nothing from it.
+  // BEST_EFFORT matches both, so either imu_topic works, live or from a bag.
+  // Depth 2000 holds ~4 s at the Go2's ~500 Hz.
+  const auto imu_qos = rclcpp::QoS(rclcpp::KeepLast(2000)).best_effort().durability_volatile();
+  sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, imu_qos, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
   sub_img = this->node->create_subscription<sensor_msgs::msg::Image>(img_topic, 200000, std::bind(&LIVMapper::img_cbk, this, std::placeholders::_1));
   
   pubLaserCloudFullRes = this->node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 100);
@@ -551,54 +570,117 @@ void LIVMapper::handleLIO()
             << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << " " << feats_undistort->points.size() << std::endl;
 }
 
-void LIVMapper::savePCD() 
+// Write `cloud` to `path` atomically: PCL writes to path.tmp, then rename(2)
+// swaps it into place. A kill mid-write therefore leaves the previous good file
+// intact instead of a truncated one.
+template <typename CloudT>
+static bool writePCDAtomic(const std::string &path, const CloudT &cloud)
 {
-  if (pcd_save_en && (pcl_wait_save->points.size() > 0 || pcl_wait_save_intensity->points.size() > 0) && pcd_save_interval < 0) 
+  if (cloud.points.empty()) return false;
+  const std::string tmp = path + ".tmp";
+  try
   {
-    std::string raw_points_dir = std::string(ROOT_DIR) + "Log/pcd/all_raw_points.pcd";
-    std::string downsampled_points_dir = std::string(ROOT_DIR) + "Log/pcd/all_downsampled_points.pcd";
-    pcl::PCDWriter pcd_writer;
+    pcl::PCDWriter w;
+    if (w.writeBinary(tmp, cloud) != 0) return false;
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) return false;
+  }
+  catch (const std::exception &e)
+  {
+    std::cerr << RED << "[pcd] write failed for " << path << ": " << e.what() << RESET << std::endl;
+    return false;
+  }
+  return true;
+}
 
-    if (img_en)
-    {
-      pcl::PointCloud<pcl::PointXYZRGB>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
-      pcl::VoxelGrid<pcl::PointXYZRGB> voxel_filter;
-      voxel_filter.setInputCloud(pcl_wait_save);
-      voxel_filter.setLeafSize(filter_size_pcd, filter_size_pcd, filter_size_pcd);
-      voxel_filter.filter(*downsampled_cloud);
-  
-      pcd_writer.writeBinary(raw_points_dir, *pcl_wait_save); // Save the raw point cloud data
-      std::cout << GREEN << "Raw point cloud data saved to: " << raw_points_dir 
+// Periodic crash-safe dump. With pcd_save.interval = -1 the whole map lives in
+// RAM until shutdown, so a SIGKILL (launch escalates SIGINT -> SIGTERM -> SIGKILL
+// 10 s after Ctrl+C) or an OOM loses everything. This drops a usable map to disk
+// every pcd_save.checkpoint_sec seconds. The buffer is NOT cleared, so the final
+// savePCD() still writes the complete cloud.
+void LIVMapper::checkpointPCD()
+{
+  if (!pcd_save_en || pcd_checkpoint_sec <= 0.0 || pcd_save_interval >= 0) return;
+
+  const double now = rclcpp::Clock(RCL_STEADY_TIME).now().seconds();
+  if (last_pcd_checkpoint_ < 0.0) { last_pcd_checkpoint_ = now; return; }
+  if (now - last_pcd_checkpoint_ < pcd_checkpoint_sec) return;
+  last_pcd_checkpoint_ = now;
+
+  const std::string dir = std::string(ROOT_DIR) + "Log/pcd/";
+  if (pcl_wait_save->points.size() > 0)
+  {
+    if (writePCDAtomic(dir + "checkpoint_raw_points.pcd", *pcl_wait_save))
+      std::cout << GREEN << "[pcd] checkpoint: " << pcl_wait_save->points.size()
+                << " pts -> Log/pcd/checkpoint_raw_points.pcd" << RESET << std::endl;
+  }
+  else if (pcl_wait_save_intensity->points.size() > 0)
+  {
+    if (writePCDAtomic(dir + "checkpoint_raw_points.pcd", *pcl_wait_save_intensity))
+      std::cout << GREEN << "[pcd] checkpoint: " << pcl_wait_save_intensity->points.size()
+                << " pts -> Log/pcd/checkpoint_raw_points.pcd" << RESET << std::endl;
+  }
+}
+
+void LIVMapper::savePCD()
+{
+  if (pcd_saved_) return;   // idempotent: run() and main() both call this
+  if (!pcd_save_en || pcd_save_interval >= 0) return;
+  if (pcl_wait_save->points.size() == 0 && pcl_wait_save_intensity->points.size() == 0)
+  {
+    std::cerr << YELLOW << "[pcd] nothing to save (0 accumulated points)" << RESET << std::endl;
+    return;
+  }
+  pcd_saved_ = true;
+
+  const std::string dir = std::string(ROOT_DIR) + "Log/pcd/";
+  const std::string raw_points_dir         = dir + "all_raw_points.pcd";
+  const std::string downsampled_points_dir = dir + "all_downsampled_points.pcd";
+
+  // Raw first, downsampling second. The VoxelGrid pass over ~1.7M points takes
+  // seconds on this Jetson; doing it before the first write is what previously
+  // let the SIGKILL escalation land with nothing on disk.
+  if (img_en)
+  {
+    if (writePCDAtomic(raw_points_dir, *pcl_wait_save))
+      std::cout << GREEN << "Raw point cloud data saved to: " << raw_points_dir
                 << " with point count: " << pcl_wait_save->points.size() << RESET << std::endl;
-      
-      pcd_writer.writeBinary(downsampled_points_dir, *downsampled_cloud); // Save the downsampled point cloud data
-      std::cout << GREEN << "Downsampled point cloud data saved to: " << downsampled_points_dir 
+
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+    pcl::VoxelGrid<pcl::PointXYZRGB> voxel_filter;
+    voxel_filter.setInputCloud(pcl_wait_save);
+    voxel_filter.setLeafSize(filter_size_pcd, filter_size_pcd, filter_size_pcd);
+    voxel_filter.filter(*downsampled_cloud);
+
+    if (writePCDAtomic(downsampled_points_dir, *downsampled_cloud))
+      std::cout << GREEN << "Downsampled point cloud data saved to: " << downsampled_points_dir
                 << " with point count after filtering: " << downsampled_cloud->points.size() << RESET << std::endl;
 
-      if(colmap_output_en)
+    if (colmap_output_en)
+    {
+      fout_points << "# 3D point list with one line of data per point\n";
+      fout_points << "#  POINT_ID, X, Y, Z, R, G, B, ERROR\n";
+      for (size_t i = 0; i < downsampled_cloud->size(); ++i)
       {
-        fout_points << "# 3D point list with one line of data per point\n";
-        fout_points << "#  POINT_ID, X, Y, Z, R, G, B, ERROR\n";
-        for (size_t i = 0; i < downsampled_cloud->size(); ++i) 
-        {
-            const auto& point = downsampled_cloud->points[i];
-            fout_points << i << " "
-                        << std::fixed << std::setprecision(6)
-                        << point.x << " " << point.y << " " << point.z << " "
-                        << static_cast<int>(point.r) << " "
-                        << static_cast<int>(point.g) << " "
-                        << static_cast<int>(point.b) << " "
-                        << 0 << std::endl;
-        }
+          const auto& point = downsampled_cloud->points[i];
+          fout_points << i << " "
+                      << std::fixed << std::setprecision(6)
+                      << point.x << " " << point.y << " " << point.z << " "
+                      << static_cast<int>(point.r) << " "
+                      << static_cast<int>(point.g) << " "
+                      << static_cast<int>(point.b) << " "
+                      << 0 << std::endl;
       }
-    }
-    else
-    {      
-      pcd_writer.writeBinary(raw_points_dir, *pcl_wait_save_intensity);
-      std::cout << GREEN << "Raw point cloud data saved to: " << raw_points_dir 
-                << " with point count: " << pcl_wait_save_intensity->points.size() << RESET << std::endl;
+      fout_points.flush();
     }
   }
+  else
+  {
+    if (writePCDAtomic(raw_points_dir, *pcl_wait_save_intensity))
+      std::cout << GREEN << "Raw point cloud data saved to: " << raw_points_dir
+                << " with point count: " << pcl_wait_save_intensity->points.size() << RESET << std::endl;
+  }
+
+  std::remove((dir + "checkpoint_raw_points.pcd").c_str());  // superseded by the full save
 }
 
 void LIVMapper::run(rclcpp::Node::SharedPtr &node) 
@@ -619,6 +701,8 @@ void LIVMapper::run(rclcpp::Node::SharedPtr &node)
     // if (!p_imu->imu_time_init) continue;
 
     stateEstimationAndMapping();
+
+    checkpointPCD();
   }
   savePCD();
 }
