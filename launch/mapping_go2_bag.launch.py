@@ -5,9 +5,18 @@ Same mapping + camera-blackboard + rviz as the live launch, but WITHOUT
 starting any sensor drivers (IMU / Hesai / RealSense). Subscribe to the
 same topics — they come from `ros2 bag play` instead.
 
+LiDAR time offset: this launch overrides time_offset.lidar_time_offset with the
+`lidar_time_offset` argument, default -0.0996. Bags recorded before the Hesai
+driver fix of 2026-09-29 stamp each scan at its END (clock.now() after the
+100 ms sweep); -0.0996 moves it back to the scan START. Bags recorded AFTER the
+fix are already stamped at the scan start -- replay those with
+lidar_time_offset:=0.0, or every point is shifted ~100 ms early. The live
+configs (go2_xt16*.yaml) hold 0.0, which is correct only for the fixed driver.
+
 Usage:
   # Terminal A
   ros2 launch fast_livo mapping_go2_bag.launch.py use_rviz:=True
+  #   post-fix bag:  ... lidar_time_offset:=0.0
   # Terminal B (foxy LD_LIBRARY_PATH workaround from CLAUDE.md)
   source /opt/ros/foxy/setup.bash && source ~/fastlivo_ws/install/setup.bash && \
     LD_LIBRARY_PATH=/home/unitree/cyclonedds_ws/install/cyclonedds/lib:$LD_LIBRARY_PATH \
@@ -38,6 +47,7 @@ def _launch_mapping(context, *args, **kwargs):
     log_file = os.path.join(_LOG_DIR, f'fastlivo_bag_{timestamp}.log')
 
     params_file = context.launch_configurations['main_params_file']
+    lidar_time_offset = context.launch_configurations['lidar_time_offset']
 
     # Neither `bash -c '... | tee'` nor `ros2 run` forwards SIGINT to the mapper, so
     # savePCD() (which runs after the rclcpp::ok() loop) never executed and Log/pcd/
@@ -51,6 +61,8 @@ def _launch_mapping(context, *args, **kwargs):
             mapper_bin,
             '--ros-args', '--remap', '__node:=laserMapping',
             '--params-file', params_file,
+            # after --params-file so it wins over the YAML's live value
+            '-p', f'time_offset.lidar_time_offset:={lidar_time_offset}',
         ],
         name='fastlivo_mapping',
         output='full',
@@ -93,6 +105,11 @@ def generate_launch_description():
         'main_params_file', default_value=main_config,
         description='Main FAST-LIVO2 parameter file')
 
+    lidar_time_offset_arg = DeclareLaunchArgument(
+        'lidar_time_offset', default_value='-0.0996',
+        description='Seconds added to each LiDAR header stamp. -0.0996 for bags '
+                    'recorded before the 2026-09-29 Hesai driver fix; 0.0 after.')
+
     camera_config_arg = DeclareLaunchArgument(
         'camera_params_file', default_value=camera_config,
         description='Camera intrinsics parameter file (vikit)')
@@ -124,6 +141,7 @@ def generate_launch_description():
     return LaunchDescription([
         use_rviz_arg,
         main_config_arg,
+        lidar_time_offset_arg,
         camera_config_arg,
         blackboard_node,
         mapping_delayed,

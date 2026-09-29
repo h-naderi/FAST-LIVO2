@@ -96,58 +96,32 @@
       # stamps at arrival and every downstream node deep-copies that header, so the
       # stamp stays correct. That conclusion still holds: the IMU stamps are fine.
       #
-      # lidar_time_offset IS NOT 0.0 -- the LiDAR header stamp is the scan END, but
-      # every consumer treats it as the scan START. Traced 2026-08-25:
+      # lidar_time_offset: 0.0 FOR LIVE RUNS ONLY -- requires the Hesai driver fix of
+      # 2026-09-29 (MAX-Brain-v1.0 hesai_lidar_driver: source_driver_ros2.hpp,
+      # udp6_1_parser.cc, lidar_types.h).
       #
-      #   hesai_lidar_driver source_driver_ros2.hpp:280-315 builds the ROS message
-      #   only after the SDK delivers a COMPLETE frame, then stamps
-      #       ros_msg.header.stamp = clock.now();
-      #   i.e. the host clock at the instant the 100 ms sweep has already finished.
-      #   The same block overwrites frame.points[i].timestamp with that one value,
-      #   which is why the driver console prints "start time" == "end time":
-      #       frame:1 points:32000 packet:250 start time:1776447362.710577
-      #                                        end time:1776447362.710577
-      #   The published per-point `timestamp` field survives only because the loop
-      #   copies the point before overwriting the original.
+      # *** DO NOT USE THIS VALUE FOR BAGS RECORDED BEFORE THAT FIX. ***
+      # mapping_go2_bag.launch.py overrides it with -0.0996 by default; pass
+      # lidar_time_offset:=0.0 there only for bags recorded after the fix.
       #
-      #   preprocess.cpp:687 (xt32_handler) sets curvature = (timestamp - time_head),
-      #   relative to the first point, and LIVMapper.cpp:802 anchors that span at
-      #   cur_head_time = header.stamp + lidar_time_offset. So with offset 0 the scan
-      #   is modelled over [header, header + 99.6 ms] when it physically occupied
-      #   [header - 99.6 ms, header]: every point enters the EKF ~100 ms too late.
+      # Before the fix the driver stamped header = clock.now() after the whole
+      # 100 ms sweep had been assembled, i.e. the scan END, while FAST-LIVO2 anchors
+      # the scan at cur_head_time = header.stamp + lidar_time_offset
+      # (LIVMapper.cpp:870) and treats it as the scan START (xt32_handler,
+      # curvature = timestamp - first point). Every point entered the EKF ~100 ms
+      # late: invisible in translation, ~3 deg of yaw error at 0.52 rad/s, the
+      # "double wall after rotation". -0.0996 (the measured 99.60 ms scan span)
+      # compensated for it.
       #
-      # Measured scan span on this bag: 99.60 ms mean over 249 scans (per-point
-      # timestamps are on the LiDAR's own unsynced clock -- 2020 epoch, 6.27 years
-      # off host time -- but the intra-scan deltas are correct, which is all the
-      # handler uses).
-      #
-      # Invisible under translation (a uniform time shift just slides the map along
-      # the travel direction, self-consistently) but during the 360-in-place cue at
-      # t+25s -- 0.524 rad/s -- it is 2.99 deg of yaw error, i.e. r * 0.052 of wall
-      # displacement: 2.6 cm at 0.5 m, 5.2 cm at 1 m, 10.4 cm at 2 m. This is the
-      # "double wall after rotation" that survived every extrinsic change, and it
-      # reproduces identically in FAST_LIO, which anchors the same way
-      # (laserMapping.cpp:393 + preprocess.cpp:494).
-      #
-      # Corroboration: pointlio's pandar_maxbrain.yaml on this robot uses the same
-      # stamp = raw - offset formula with time_lag_imu_to_lidar: -0.1. An earlier
-      # note here dismissed that as "the OPPOSITE sign" -- that comparison was about
-      # delivery latency, which is a different question from scan phase. On scan
-      # phase the -0.1 agrees. LI_Init's 0.131284 matches in magnitude, though its
-      # sign convention is unverified.
-      #
-      # NOT YET VALIDATED against the map -- this is derived from driver source and
-      # driver logs. The true value is likely slightly larger than the scan span,
-      # since a few ms of packet assembly sit between the last point and clock.now();
-      # sweep -0.09 .. -0.13 if -0.0996 leaves residual splitting.
-      #
-      # Proper fix is in the driver -- capture the span before the overwrite:
-      #   double span = frame.points[frame.points_num-1].timestamp
-      #               - frame.points[0].timestamp;
-      #   ros_msg.header.stamp = current_time - rclcpp::Duration::from_seconds(span);
+      # The fixed driver maps the lidar's free-running HW clock onto the host clock
+      # via min(packet receive time - packet HW time) over a 2 s window, and stamps
+      # header = first point on the host clock (the scan START) and each point's
+      # `timestamp` = its HW time + that offset. Verified live 2026-09-29:
+      # header == first point to 0.000 ms, span 99.60 ms, header 105.5 ms before
+      # the subscriber receives it (= span + 5.9 ms delivery), today's date.
       imu_time_offset: 0.0
       img_time_offset: 0.0
-      lidar_time_offset: -0.0996
+      lidar_time_offset: 0.0     # LIVE only -- NOT for pre-2026-09-29 bags (see above)
       exposure_time_init: 0.0
 
     preprocess:
