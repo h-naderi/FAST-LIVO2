@@ -2,3 +2,9 @@ Log/*
 build/*
 logs/
 LIO_REPLACEMENT_FEASIBILITY.md
+
+# backups and Python bytecode
+*.bak
+*.qosbak
+*.pyc
+__pycache__/
